@@ -26,6 +26,9 @@ describe("Ephememe runtime", () => {
       TELEGRAM_WEBHOOK_SECRET: undefined,
     });
     resetRuntimeOverrides();
+    setRuntimeOverrides({
+      telegramChatActionSender: async () => {},
+    });
   });
 
   it("returns health status", async () => {
@@ -36,21 +39,6 @@ describe("Ephememe runtime", () => {
       ok: true,
       service: "ephememe-runtime",
       botUsername: "ephememe_bot",
-    });
-  });
-
-  it("rejects invalid telegram payloads", async () => {
-    const response = await dispatch(
-      new IncomingRequest("https://example.com/telegram/webhook", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ nope: true }),
-      }),
-    );
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toMatchObject({
-      error: "missing numeric update_id",
     });
   });
 
@@ -67,11 +55,12 @@ describe("Ephememe runtime", () => {
     const { agentId, userId } = nextIdentity();
     const outboundMessages: Array<{ chatId: number; text: string }> = [];
     const model = new MockLanguageModelV3({
-      doGenerate: [textResult("Hello from the durable agent.")],
+      doGenerate: async () => textResult("Hello from the durable agent."),
     });
 
     setRuntimeOverrides({
       modelFactory: () => model,
+      telegramChatActionSender: async () => {},
       telegramSender: async ({ chatId, text }) => {
         outboundMessages.push({ chatId, text });
         return { messageId: 9001 };
@@ -87,7 +76,6 @@ describe("Ephememe runtime", () => {
     );
 
     expect(webhookResponse.status).toBe(200);
-    expect(await webhookResponse.text()).toBe("ok");
 
     const snapshotResponse = await dispatch(
       new IncomingRequest(
@@ -132,15 +120,16 @@ describe("Ephememe runtime", () => {
     });
   });
 
-  it("deduplicates telegram updates", async () => {
+  it("deduplicates telegram updates before a second run is created", async () => {
     const { agentId, userId } = nextIdentity();
     const outboundMessages: string[] = [];
     const model = new MockLanguageModelV3({
-      doGenerate: [textResult("Only once.")],
+      doGenerate: async () => textResult("Only once."),
     });
 
     setRuntimeOverrides({
       modelFactory: () => model,
+      telegramChatActionSender: async () => {},
       telegramSender: async ({ text }) => {
         outboundMessages.push(text);
         return { messageId: 9002 };
@@ -184,29 +173,37 @@ describe("Ephememe runtime", () => {
     expect(model.doGenerateCalls).toHaveLength(1);
     expect(outboundMessages).toEqual(["Only once."]);
     expect(snapshot.contactLog).toHaveLength(1);
-    expect(snapshot.recentRuns[0]?.outcome).toBe("duplicate-update");
+    expect(snapshot.recentRuns).toHaveLength(1);
+    expect(snapshot.recentRuns[0]?.outcome).toBe("replied");
   });
 
   it("handles a silent admin wake that writes memory and schedules a follow-up", async () => {
     const { agentId } = nextIdentity();
     const outboundMessages: string[] = [];
+    let generateCall = 0;
     const model = new MockLanguageModelV3({
-      doGenerate: [
-        toolCallResult("writeFile", {
-          path: "/memory/derived/active-context.md",
-          content: "# Active Context\n\nMaintenance updated this summary.",
-        }),
-        toolCallResult("schedule", {
-          action: "create",
-          when: "3600",
-          payload: { notes: "revisit active context" },
-        }),
-        textResult("[[silence]]"),
-      ],
+      doGenerate: async () => {
+        generateCall += 1;
+        if (generateCall === 1) {
+          return toolCallResult("writeFile", {
+            path: "/memory/derived/active-context.md",
+            content: "# Active Context\n\nMaintenance updated this summary.",
+          });
+        }
+        if (generateCall === 2) {
+          return toolCallResult("schedule", {
+            action: "create",
+            when: "3600",
+            payload: { notes: "revisit active context" },
+          });
+        }
+        return textResult("[[silence]]");
+      },
     });
 
     setRuntimeOverrides({
       modelFactory: () => model,
+      telegramChatActionSender: async () => {},
       telegramSender: async ({ text }) => {
         outboundMessages.push(text);
         return { messageId: 9003 };

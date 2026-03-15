@@ -6,7 +6,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "ephememe-bot",
 	"main": "src/index.ts",
-	"compatibility_date": "2026-03-13",
+	"compatibility_date": "2026-03-10",
 	"observability": {
 		"enabled": true
 	},

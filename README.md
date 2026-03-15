@@ -4,20 +4,20 @@ A personal agent runtime on Cloudflare Workers. It talks to you through Telegram
 
 ## How it works
 
-Each Telegram user gets their own [Durable Object](https://developers.cloudflare.com/durable-objects/) — an isolated runtime with its own filesystem and SQLite tables. When you send a message, the agent reads its memory files, thinks with a language model, replies, and updates its memory. Then it goes back to sleep.
+Each Telegram user gets their own [Durable Object](https://developers.cloudflare.com/durable-objects/) — an isolated runtime with its own filesystem and SQLite tables. Incoming work is first recorded in a per-user mailbox. The agent drains that mailbox one batch at a time: it reads memory files, thinks with a language model, replies if needed, updates memory, and goes back to sleep.
 
 Memory is stored as plain files — `identity.md`, `preferences.md`, `open-loops.md`, `recent-turns.jsonl`. The agent reads and writes these files using tools available to the model. There are no embeddings, no vector stores. The serialization format for identity is natural language.
 
 External pages can also be imported into the workspace under `/memory/imports`. Search results stay in model context; scraped pages become files the agent can inspect incrementally with `readFile` or `bash`.
 
-The agent can schedule its own future wake-ups. Maintenance wakes are silent — the agent reviews recent conversations, updates its context files, and goes back to sleep. Outbound wakes deliver a message the user explicitly asked for.
+The agent can schedule its own future wake-ups. Maintenance wakes are silent — the agent reviews recent conversations, updates its context files, and goes back to sleep. Outbound wakes deliver a message the user explicitly asked for. If follow-up Telegram messages arrive while the agent is already busy, they are queued and drained after the current run instead of being dropped. Multiple queued Telegram follow-ups are handled as one burst and produce one reply.
 
 ## Architecture
 
 ```
 Telegram → Hono Worker → per-user PersonalAgent Durable Object
                               ├── AgentFS (file memory)
-                              ├── SQLite (coordination, logs)
+                              ├── SQLite (coordination, mailbox, logs)
                               ├── ToolLoopAgent (model reasoning)
                               └── Scheduled wakes (self-directed)
 ```
@@ -55,6 +55,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 | `schedule` | Create, list, or cancel future wake-ups |
 | `getTime` | Current time |
 
+Mailbox drain priority is: queued Telegram bursts first, then outbound scheduled messages, then maintenance wakes.
+
 ## Endpoints
 
 ```
@@ -63,7 +65,7 @@ GET  /health                        Health check
 POST /telegram/webhook              Telegram webhook receiver
 GET  /admin/agents/:id              Agent state inspection (auth required)
 GET  /admin/agents/:id/memory       Memory file/directory inspection (auth required)
-POST /admin/agents/:id/wake         Manual maintenance wake (auth required)
+POST /admin/agents/:id/wake         Enqueue maintenance wake (auth required)
 ```
 
 ## Setup

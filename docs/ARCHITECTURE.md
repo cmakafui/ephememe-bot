@@ -20,10 +20,10 @@ If a design choice conflicts with these, the design choice loses.
 
 Transport and control only:
 
-- Receives `POST /telegram/webhook`, validates, dispatches via grammY
+- Receives `POST /telegram/webhook`, dispatches via grammY
 - Ignores non-private chats
 - Resolves per-user agent with `getAgentByName("tg-user:<userId>")`
-- Hands off work with `executionCtx.waitUntil()`
+- Hands off work with `executionCtx.waitUntil()` so webhook handling stays thin
 - Exposes authenticated admin routes under `/admin/agents/:id`
 
 ### PersonalAgent Durable Object (`src/personal-agent.ts`)
@@ -31,6 +31,7 @@ Transport and control only:
 The stateful runtime. One instance per user.
 
 - Deduplicates Telegram `update_id`
+- Stores accepted work in a per-user mailbox
 - Seeds and maintains the `/memory` filesystem
 - Runs `ToolLoopAgent` inside `keepAliveWhile()`
 - Decides whether to reply (inbound) or stay silent (maintenance wakes)
@@ -47,22 +48,24 @@ The stateful runtime. One instance per user.
 ## Runtime loop
 
 1. Receive trigger
-2. Gate checks (dedupe, lease, staleness)
-3. Ensure memory spine exists
-4. Build manifest from spine files + trigger data + recent turns
-5. Run `ToolLoopAgent` with tools: `bash`, `readFile`, `writeFile`, `search`, `scrape`, `schedule`, `getTime`
-6. Persist side effects (memory writes, turn log, summary)
-7. Optionally send Telegram reply
-8. Return to idle
+2. Gate checks (dedupe, staleness)
+3. Enqueue accepted work into the per-user mailbox
+4. If idle, acquire the run lease and drain the mailbox
+5. Select the next executable batch: Telegram burst first, then outbound scheduled work, then maintenance
+6. Build manifest from spine files + trigger data + recent turns
+7. Run `ToolLoopAgent` with tools: `bash`, `readFile`, `writeFile`, `search`, `scrape`, `schedule`, `getTime`
+8. Persist side effects (memory writes, turn log, summary)
+9. Optionally send Telegram reply
+10. Continue draining until the mailbox is empty, then return to idle
 
 ## Gate behavior
 
 - Reject duplicate Telegram `update_id`
-- Reject if another run lease is active
 - Reject stale scheduled wakes (>30 minutes old)
 - Ignore non-private Telegram chats
+- If a run lease is already active, accept the event and enqueue it instead of dropping it
 
-Gate state lives in SQLite tables inside the Durable Object.
+Gate state and mailbox state live in SQLite tables inside the Durable Object.
 
 ## Durable state
 
@@ -70,6 +73,7 @@ Gate state lives in SQLite tables inside the Durable Object.
 
 - `coordination_state` — last inbound/outbound times, active run lease
 - `processed_updates` — Telegram update deduplication
+- `mailbox` — accepted work waiting to be drained
 - `run_log` — audit trail of all runs
 - `contact_log` — record of all outbound Telegram messages
 
@@ -98,6 +102,12 @@ After each run:
 2. Include only the last 12 turns in the next prompt (80 stored max)
 3. Refresh `recent-summary.md`
 
+When multiple Telegram follow-ups queue while the agent is busy:
+1. The current run continues normally
+2. Queued Telegram messages are drained in the next chat run
+3. Multiple queued Telegram messages are batched into one coherent reply
+4. The reply is sent in reply to the newest Telegram message in that burst
+
 For explicit web lookup requests:
 1. `search` returns compact results directly in context
 2. `scrape` saves full page content into `/memory/imports/...`
@@ -116,6 +126,7 @@ During maintenance wakes, the agent also:
 - Two kinds: `maintenance` (silent) and `outbound-message` (sends stored text)
 - Same-kind schedules are collapsed — new one replaces old
 - Outbound schedules require explicit `chatId` and message text
+- When both mailbox and scheduled work are pending, chat work drains before scheduled work
 
 ## Telegram integration
 
@@ -130,7 +141,7 @@ Requires `Authorization: Bearer <ADMIN_API_TOKEN>`.
 
 - `GET /admin/agents/:id` — coordination state, schedules, recent runs, contact log
 - `GET /admin/agents/:id/memory?path=...` — read memory files/directories
-- `POST /admin/agents/:id/wake` — trigger a maintenance wake
+- `POST /admin/agents/:id/wake` — enqueue a maintenance wake and drain immediately if the agent is idle
 
 ## Explicit deferrals
 

@@ -9,6 +9,15 @@ import { z } from "zod";
 import { AgentFS, type CloudflareStorage } from "agentfs-sdk/cloudflare";
 import { Bash } from "just-bash";
 import {
+  type ExecutableTrigger,
+  type MailboxKind,
+  type MailboxRow,
+  mailboxKindForTrigger,
+  isTelegramBatchTrigger,
+  latestTelegramMessage,
+  selectNextMailboxExecution,
+} from "./mailbox";
+import {
   createAgentModel,
   sendTelegramChatAction,
   sendTelegramMessage,
@@ -25,8 +34,8 @@ import type {
   TelegramTrigger,
   TriggerType,
 } from "./types";
+import { MEMORY_ROOT, normalizeMemoryPath, resolveWorkspacePath } from "./workspace-paths";
 
-const MEMORY_ROOT = "/memory";
 const IMPORTS_ROOT = "/memory/imports";
 const SCHEDULE_STALE_AFTER_MS = 30 * 60 * 1000;
 const RUN_LEASE_MS = 2 * 60 * 1000;
@@ -90,6 +99,18 @@ type SessionResult = {
   replySent: boolean;
 };
 
+type ClaimedMailboxBatch = {
+  mailboxIds: number[];
+  trigger: ExecutableTrigger;
+};
+
+type PendingMailboxRowRecord = {
+  id: number;
+  kind: MailboxKind;
+  enqueued_at: string;
+  payload_json: string;
+};
+
 export class PersonalAgent extends Agent<PersonalAgentEnv> {
   private fs: AgentFS;
   private bashPromise?: Promise<Bash>;
@@ -101,13 +122,13 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
   }
 
   async onTelegramUpdate(trigger: TelegramTrigger): Promise<SessionResult> {
-    return this.runSession(trigger);
+    return this.acceptTrigger(trigger);
   }
 
   async onScheduledWakeUp(
     payload: ScheduledWakePayload,
   ): Promise<SessionResult> {
-    return this.runSession(payload);
+    return this.acceptTrigger(payload);
   }
 
   async getAdminSnapshot(): Promise<AgentAdminSnapshot> {
@@ -184,29 +205,74 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
     };
   }
 
-  private async runSession(trigger: SessionTrigger): Promise<SessionResult> {
+  private async acceptTrigger(trigger: SessionTrigger): Promise<SessionResult> {
     await this.ensureMemorySeeded();
+    this.recoverMailboxAfterExpiredLease();
 
-    const runId = this.insertRunLog(trigger.type);
-    let replySent = false;
-    let leaseAcquired = false;
+    if (trigger.type === "telegram" && this.hasProcessedUpdate(trigger.updateId)) {
+      return {
+        blocked: true,
+        outcome: "duplicate-update",
+        replySent: false,
+      };
+    }
 
+    if (trigger.type === "scheduled" && isStaleScheduledWake(trigger)) {
+      return {
+        blocked: true,
+        outcome: "stale-scheduled-wake",
+        replySent: false,
+      };
+    }
+
+    this.enqueueTrigger(trigger);
+
+    if (this.hasActiveRunLease()) {
+      return {
+        blocked: false,
+        outcome: "queued",
+        replySent: false,
+      };
+    }
+
+    this.acquireRunLease();
     try {
-      const gate = this.checkGate(trigger);
-      if (gate.blocked) {
-        this.finishRunLog(runId, {
-          replySent: false,
-          outcome: gate.reason,
-          errorText: null,
-        });
-        return {
-          blocked: true,
-          outcome: gate.reason,
-          replySent: false,
-        };
+      return await this.drainMailboxUntilIdle();
+    } finally {
+      this.releaseRunLease();
+    }
+  }
+
+  private async drainMailboxUntilIdle(): Promise<SessionResult> {
+    let lastResult: SessionResult = {
+      blocked: false,
+      outcome: "queued",
+      replySent: false,
+    };
+
+    while (true) {
+      const claim = this.claimNextMailboxBatch();
+      if (!claim) {
+        return lastResult;
       }
 
-      leaseAcquired = true;
+      try {
+        lastResult = await this.runSession(claim.trigger);
+        this.completeMailboxClaim(claim);
+      } catch (error) {
+        this.rollbackMailboxClaim(claim);
+        throw error;
+      }
+    }
+  }
+
+  private async runSession(trigger: ExecutableTrigger): Promise<SessionResult> {
+    await this.ensureMemorySeeded();
+
+    const runId = this.insertRunLog(executionTriggerType(trigger));
+    let replySent = false;
+
+    try {
       if (trigger.type === "scheduled" && isScheduledOutbound(trigger)) {
         await sendTelegramMessage({
           token: this.env.BOT_TOKEN,
@@ -214,7 +280,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
           text: trigger.outboundText,
         });
         replySent = true;
-        this.recordOutbound(trigger.chatId, trigger.outboundText, trigger.type);
+        this.recordOutbound(trigger.chatId, trigger.outboundText, "scheduled");
         await this.refreshMemoryLoop(trigger, trigger.outboundText, true);
         this.finishRunLog(runId, {
           replySent: true,
@@ -229,11 +295,12 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         };
       }
 
-      if (trigger.type === "telegram") {
+      if (isTelegramBatchTrigger(trigger)) {
+        const latest = latestTelegramMessage(trigger);
         try {
           await sendTelegramChatAction({
             token: this.env.BOT_TOKEN,
-            chatId: trigger.chatId,
+            chatId: latest.chatId,
             action: "typing",
           });
         } catch (error) {
@@ -263,27 +330,23 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         }),
       );
 
-      const finalText =
-        trigger.type === "telegram"
-          ? normalizeTelegramReply(result.text, trigger.text)
-          : result.text.trim();
+      const finalText = isTelegramBatchTrigger(trigger)
+        ? normalizeTelegramReply(result.text, latestTelegramMessage(trigger).text)
+        : result.text.trim();
 
-      if (trigger.type === "telegram" && shouldSendReply(finalText)) {
+      if (isTelegramBatchTrigger(trigger) && shouldSendReply(finalText)) {
+        const latest = latestTelegramMessage(trigger);
         await sendTelegramMessage({
           token: this.env.BOT_TOKEN,
-          chatId: trigger.chatId,
+          chatId: latest.chatId,
           text: finalText,
-          replyToMessageId: trigger.messageId,
+          replyToMessageId: latest.messageId,
         });
         replySent = true;
-        this.recordOutbound(trigger.chatId, finalText, trigger.type);
+        this.recordOutbound(latest.chatId, finalText, "telegram");
       }
 
       await this.refreshMemoryLoop(trigger, finalText, replySent);
-
-      if (trigger.type === "telegram") {
-        this.markProcessedUpdateDone(trigger.updateId);
-      }
 
       this.finishRunLog(runId, {
         replySent,
@@ -297,10 +360,6 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         replySent,
       };
     } catch (error) {
-      if (trigger.type === "telegram") {
-        this.deleteProcessedUpdate(trigger.updateId);
-      }
-
       this.finishRunLog(runId, {
         replySent,
         outcome: "error",
@@ -308,10 +367,6 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
       });
 
       throw error;
-    } finally {
-      if (leaseAcquired) {
-        this.releaseRunLease();
-      }
     }
   }
 
@@ -341,6 +396,17 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         status TEXT NOT NULL,
         first_seen_at TEXT NOT NULL,
         completed_at TEXT
+      )
+    `;
+
+    this.sql`
+      CREATE TABLE IF NOT EXISTS mailbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        enqueued_at TEXT NOT NULL,
+        claimed_at TEXT,
+        payload_json TEXT NOT NULL
       )
     `;
 
@@ -385,44 +451,84 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
     };
   }
 
-  private checkGate(
-    trigger: SessionTrigger,
-  ): { blocked: true; reason: string } | { blocked: false } {
-    const now = new Date();
-
-    if (trigger.type === "telegram") {
-      const existing = this.sql<{ update_id: number }>`
-        SELECT update_id
-        FROM processed_updates
-        WHERE update_id = ${trigger.updateId}
-        LIMIT 1
-      `;
-      if (existing.length > 0) {
-        return { blocked: true, reason: "duplicate-update" };
-      }
-    }
-
-    if (
-      trigger.type === "scheduled" &&
-      Date.now() - Date.parse(trigger.scheduledFor) > SCHEDULE_STALE_AFTER_MS
-    ) {
-      return { blocked: true, reason: "stale-scheduled-wake" };
-    }
-
+  private hasActiveRunLease(): boolean {
     const coordination = this.getCoordinationState();
-    if (
+    return Boolean(
       coordination.activeRunLeaseUntil &&
-      Date.parse(coordination.activeRunLeaseUntil) > Date.now()
-    ) {
-      return { blocked: true, reason: "run-already-active" };
-    }
+        Date.parse(coordination.activeRunLeaseUntil) > Date.now(),
+    );
+  }
 
+  private acquireRunLease(): void {
     this.sql`
       UPDATE coordination_state
       SET active_run_lease_until = ${new Date(
-        now.getTime() + RUN_LEASE_MS,
+        Date.now() + RUN_LEASE_MS,
       ).toISOString()}
       WHERE id = 1
+    `;
+  }
+
+  private releaseRunLease(): void {
+    this.sql`
+      UPDATE coordination_state
+      SET active_run_lease_until = NULL
+      WHERE id = 1
+    `;
+  }
+
+  private recoverMailboxAfterExpiredLease(): void {
+    const coordination = this.getCoordinationState();
+    const leaseIsActive =
+      coordination.activeRunLeaseUntil &&
+      Date.parse(coordination.activeRunLeaseUntil) > Date.now();
+
+    if (leaseIsActive) {
+      return;
+    }
+
+    this.releaseRunLease();
+
+    this.sql`
+      UPDATE mailbox
+      SET status = ${"pending"}, claimed_at = NULL
+      WHERE status = ${"processing"}
+    `;
+
+    this.sql`
+      UPDATE processed_updates
+      SET status = ${"queued"}, completed_at = NULL
+      WHERE status = ${"processing"}
+    `;
+  }
+
+  private hasProcessedUpdate(updateId: number): boolean {
+    const existing = this.sql<{ update_id: number }>`
+      SELECT update_id
+      FROM processed_updates
+      WHERE update_id = ${updateId}
+      LIMIT 1
+    `;
+    return existing.length > 0;
+  }
+
+  private enqueueTrigger(trigger: SessionTrigger): void {
+    const enqueuedAt = new Date().toISOString();
+    this.sql`
+      INSERT INTO mailbox (
+        kind,
+        status,
+        enqueued_at,
+        claimed_at,
+        payload_json
+      )
+      VALUES (
+        ${mailboxKindForTrigger(trigger)},
+        ${"pending"},
+        ${enqueuedAt},
+        NULL,
+        ${JSON.stringify(trigger)}
+      )
     `;
 
     if (trigger.type === "telegram") {
@@ -435,7 +541,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         )
         VALUES (
           ${trigger.updateId},
-          ${"processing"},
+          ${"queued"},
           ${trigger.receivedAt},
           NULL
         )
@@ -447,31 +553,140 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         WHERE id = 1
       `;
     }
-
-    return { blocked: false };
   }
 
-  private releaseRunLease(): void {
+  private claimNextMailboxBatch(): ClaimedMailboxBatch | null {
+    while (true) {
+      const pendingRows = this.readPendingMailboxRows();
+      const selection = selectNextMailboxExecution({
+        rows: pendingRows,
+        nowMs: Date.now(),
+        staleAfterMs: SCHEDULE_STALE_AFTER_MS,
+      });
+
+      if (!selection) {
+        return null;
+      }
+
+      for (const id of selection.deleteIds) {
+        this.deleteMailboxRow(id);
+      }
+
+      if (!selection.trigger || selection.processingIds.length === 0) {
+        continue;
+      }
+
+      const claimedAt = new Date().toISOString();
+      for (const id of selection.processingIds) {
+        this.sql`
+          UPDATE mailbox
+          SET status = ${"processing"}, claimed_at = ${claimedAt}
+          WHERE id = ${id} AND status = ${"pending"}
+        `;
+      }
+
+      if (isTelegramBatchTrigger(selection.trigger)) {
+        this.markProcessedUpdatesProcessing(
+          selection.trigger.messages.map((message) => message.updateId),
+        );
+      }
+
+      return {
+        mailboxIds: selection.processingIds,
+        trigger: selection.trigger,
+      };
+    }
+  }
+
+  private readPendingMailboxRows(): MailboxRow[] {
+    const rows = this.sql<PendingMailboxRowRecord>`
+      SELECT id, kind, enqueued_at, payload_json
+      FROM mailbox
+      WHERE status = ${"pending"}
+      ORDER BY id ASC
+    `;
+
+    return rows.flatMap((row) => {
+      try {
+        return [
+          {
+            id: row.id,
+            kind: row.kind,
+            enqueuedAt: row.enqueued_at,
+            payload: JSON.parse(row.payload_json) as SessionTrigger,
+          },
+        ];
+      } catch {
+        this.deleteMailboxRow(row.id);
+        return [];
+      }
+    });
+  }
+
+  private completeMailboxClaim(claim: ClaimedMailboxBatch): void {
+    for (const id of claim.mailboxIds) {
+      this.deleteMailboxRow(id);
+    }
+
+    if (isTelegramBatchTrigger(claim.trigger)) {
+      this.markProcessedUpdatesDone(
+        claim.trigger.messages.map((message) => message.updateId),
+      );
+    }
+  }
+
+  private rollbackMailboxClaim(claim: ClaimedMailboxBatch): void {
+    for (const id of claim.mailboxIds) {
+      this.sql`
+        UPDATE mailbox
+        SET status = ${"pending"}, claimed_at = NULL
+        WHERE id = ${id}
+      `;
+    }
+
+    if (isTelegramBatchTrigger(claim.trigger)) {
+      this.markProcessedUpdatesQueued(
+        claim.trigger.messages.map((message) => message.updateId),
+      );
+    }
+  }
+
+  private deleteMailboxRow(id: number): void {
     this.sql`
-      UPDATE coordination_state
-      SET active_run_lease_until = NULL
-      WHERE id = 1
+      DELETE FROM mailbox
+      WHERE id = ${id}
     `;
   }
 
-  private deleteProcessedUpdate(updateId: number): void {
-    this.sql`
-      DELETE FROM processed_updates
-      WHERE update_id = ${updateId}
-    `;
+  private markProcessedUpdatesProcessing(updateIds: number[]): void {
+    for (const updateId of updateIds) {
+      this.sql`
+        UPDATE processed_updates
+        SET status = ${"processing"}, completed_at = NULL
+        WHERE update_id = ${updateId}
+      `;
+    }
   }
 
-  private markProcessedUpdateDone(updateId: number): void {
-    this.sql`
-      UPDATE processed_updates
-      SET status = ${"done"}, completed_at = ${new Date().toISOString()}
-      WHERE update_id = ${updateId}
-    `;
+  private markProcessedUpdatesQueued(updateIds: number[]): void {
+    for (const updateId of updateIds) {
+      this.sql`
+        UPDATE processed_updates
+        SET status = ${"queued"}, completed_at = NULL
+        WHERE update_id = ${updateId}
+      `;
+    }
+  }
+
+  private markProcessedUpdatesDone(updateIds: number[]): void {
+    const completedAt = new Date().toISOString();
+    for (const updateId of updateIds) {
+      this.sql`
+        UPDATE processed_updates
+        SET status = ${"done"}, completed_at = ${completedAt}
+        WHERE update_id = ${updateId}
+      `;
+    }
   }
 
   private insertRunLog(triggerType: TriggerType): number {
@@ -553,28 +768,28 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
   }
 
   private async ensureMemorySeeded(): Promise<void> {
-    for (const [path, content] of Object.entries(SPINE_FILES)) {
-      const exists = await this.pathExists(path);
+    for (const [targetPath, content] of Object.entries(SPINE_FILES)) {
+      const exists = await this.pathExists(targetPath);
       if (!exists) {
-        await this.writeWorkspaceFile(path, content);
+        await this.writeWorkspaceFile(targetPath, content);
       }
     }
   }
 
-  private async pathExists(path: string): Promise<boolean> {
+  private async pathExists(targetPath: string): Promise<boolean> {
     try {
-      await this.fs.stat(path);
+      await this.fs.stat(targetPath);
       return true;
     } catch {
       return false;
     }
   }
 
-  private async buildManifest(trigger: SessionTrigger): Promise<string> {
+  private async buildManifest(trigger: ExecutableTrigger): Promise<string> {
     const sections = await Promise.all(
-      MANIFEST_SPINE_PATHS.map(async (path) => {
-        const content = await this.fs.readFile(path, "utf8");
-        return [`FILE: ${path}`, content.trim()].join("\n");
+      MANIFEST_SPINE_PATHS.map(async (targetPath) => {
+        const content = await this.fs.readFile(targetPath, "utf8");
+        return [`FILE: ${targetPath}`, content.trim()].join("\n");
       }),
     );
     const recentTurns = await this.getRecentTurnsForPrompt();
@@ -582,12 +797,15 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
     return [
       `Current time: ${new Date().toISOString()}`,
       `Trigger type: ${trigger.type}`,
-      trigger.type === "telegram"
+      isTelegramBatchTrigger(trigger)
         ? [
-            `User ID: ${trigger.userId}`,
-            `Chat ID: ${trigger.chatId}`,
-            `Received at: ${trigger.receivedAt}`,
-            `Incoming text: ${trigger.text}`,
+            `User ID: ${latestTelegramMessage(trigger).userId}`,
+            `Chat ID: ${latestTelegramMessage(trigger).chatId}`,
+            `Queued message count: ${trigger.messages.length}`,
+            "Incoming user messages:",
+            ...trigger.messages.map((message) =>
+              formatTurnNote(message.receivedAt, "user", message.text),
+            ),
           ].join("\n")
         : [
             `Reason: ${trigger.reason}`,
@@ -601,7 +819,9 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
       ...sections,
       "",
       "Recent turns:",
-      recentTurns.length > 0 ? recentTurns.join("\n") : "No recent turns recorded yet.",
+      recentTurns.length > 0
+        ? recentTurns.join("\n")
+        : "No recent turns recorded yet.",
     ].join("\n\n");
   }
 
@@ -790,7 +1010,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
     });
   }
 
-  private makeScheduleTool(trigger: SessionTrigger) {
+  private makeScheduleTool(trigger: ExecutableTrigger) {
     return tool({
       description:
         "Create, list, or cancel future wake-ups for this agent. Supports silent maintenance wakes and explicit outbound Telegram messages requested by the user.",
@@ -819,6 +1039,9 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         const kind = normalizeScheduledWakeKind(payload?.kind);
         const outboundText =
           typeof payload?.message === "string" ? payload.message.trim() : undefined;
+        const latestTelegram = isTelegramBatchTrigger(trigger)
+          ? latestTelegramMessage(trigger)
+          : null;
 
         for (const schedule of this.getSchedules()) {
           if (schedule.callback !== "onScheduledWakeUp") {
@@ -827,38 +1050,35 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
           const scheduledPayload = schedule.payload as
             | Partial<ScheduledWakePayload>
             | undefined;
-          const sameKind =
-            (scheduledPayload?.kind ?? "maintenance") === kind;
+          const sameKind = (scheduledPayload?.kind ?? "maintenance") === kind;
           if (sameKind) {
             await this.cancelSchedule(schedule.id);
           }
         }
 
+        const parsedWhen = parseWhen(when);
         const normalizedPayload: ScheduledWakePayload = {
           type: "scheduled",
           kind,
           reason: kind === "outbound-message" ? "outbound-message" : "maintenance",
           scheduledFor:
-            parseWhen(when) instanceof Date
-              ? (parseWhen(when) as Date).toISOString()
-              : String(when),
+            parsedWhen instanceof Date ? parsedWhen.toISOString() : String(parsedWhen),
           source: "agent",
           notes:
             typeof payload?.notes === "string" ? String(payload.notes) : undefined,
           allowSend: kind === "outbound-message",
           chatId:
-            kind === "outbound-message" && trigger.type === "telegram"
-              ? trigger.chatId
+            kind === "outbound-message" && latestTelegram
+              ? latestTelegram.chatId
               : undefined,
-          outboundText:
-            kind === "outbound-message" ? outboundText : undefined,
+          outboundText: kind === "outbound-message" ? outboundText : undefined,
           createdFromMessageId:
-            kind === "outbound-message" && trigger.type === "telegram"
-              ? trigger.messageId
+            kind === "outbound-message" && latestTelegram
+              ? latestTelegram.messageId
               : undefined,
           userId:
-            kind === "outbound-message" && trigger.type === "telegram"
-              ? trigger.userId
+            kind === "outbound-message" && latestTelegram
+              ? latestTelegram.userId
               : undefined,
         };
 
@@ -871,11 +1091,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
           );
         }
 
-        return this.schedule(
-          parseWhen(when),
-          "onScheduledWakeUp",
-          normalizedPayload,
-        );
+        return this.schedule(parsedWhen, "onScheduledWakeUp", normalizedPayload);
       },
     });
   }
@@ -898,7 +1114,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
   }
 
   private async refreshMemoryLoop(
-    trigger: SessionTrigger,
+    trigger: ExecutableTrigger,
     finalText: string,
     replySent: boolean,
   ): Promise<void> {
@@ -907,49 +1123,37 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
   }
 
   private async appendTurnRecords(
-    trigger: SessionTrigger,
+    trigger: ExecutableTrigger,
     finalText: string,
     replySent: boolean,
   ): Promise<void> {
-    if (trigger.type !== "telegram") {
-      if (trigger.type === "scheduled" && replySent && isScheduledOutbound(trigger)) {
-        const existing = await this.fs.readFile(
-          "/memory/journal/recent-turns.jsonl",
-          "utf8",
-        );
-        const records = parseRecentTurnRecords(existing);
-        records.push({
-          ts: new Date().toISOString(),
-          speaker: "agent",
-          text: shortenForNote(trigger.outboundText, 600),
-        });
-        const trimmed = records.slice(-MAX_RECENT_TURNS_STORED);
-        const content = trimmed.map((record) => JSON.stringify(record)).join("\n");
-        await this.fs.writeFile(
-          "/memory/journal/recent-turns.jsonl",
-          content,
-          "utf8",
-        );
-      }
-      return;
-    }
-
     const existing = await this.fs.readFile(
       "/memory/journal/recent-turns.jsonl",
       "utf8",
     );
     const records = parseRecentTurnRecords(existing);
-    records.push({
-      ts: trigger.receivedAt,
-      speaker: "user",
-      text: shortenForNote(trigger.text, 600),
-    });
 
-    if (replySent && shouldSendReply(finalText)) {
+    if (isTelegramBatchTrigger(trigger)) {
+      for (const message of trigger.messages) {
+        records.push({
+          ts: message.receivedAt,
+          speaker: "user",
+          text: shortenForNote(message.text, 600),
+        });
+      }
+
+      if (replySent && shouldSendReply(finalText)) {
+        records.push({
+          ts: new Date().toISOString(),
+          speaker: "agent",
+          text: shortenForNote(finalText, 600),
+        });
+      }
+    } else if (replySent && isScheduledOutbound(trigger)) {
       records.push({
         ts: new Date().toISOString(),
         speaker: "agent",
-        text: shortenForNote(finalText, 600),
+        text: shortenForNote(trigger.outboundText, 600),
       });
     }
 
@@ -959,7 +1163,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
   }
 
   private async writeRecentSummary(
-    trigger: SessionTrigger,
+    trigger: ExecutableTrigger,
     finalText: string,
     replySent: boolean,
   ): Promise<void> {
@@ -1002,6 +1206,9 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
 
   private async ensureWorkspaceDirectory(targetPath: string): Promise<void> {
     const normalizedPath = normalizeMemoryPath(targetPath);
+    if (!(await this.pathExists(MEMORY_ROOT))) {
+      await this.fs.mkdir(MEMORY_ROOT);
+    }
     const segments = normalizedPath.split("/").filter(Boolean);
     let current = "";
 
@@ -1017,7 +1224,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
   }
 }
 
-function buildSystemInstructions(trigger: SessionTrigger): string {
+function buildSystemInstructions(trigger: ExecutableTrigger): string {
   return [
     "You are an ephemeral personal agent with durable memory in /memory.",
     "Use the available tools to inspect and update memory when useful.",
@@ -1036,15 +1243,16 @@ function buildSystemInstructions(trigger: SessionTrigger): string {
     "Only inbound Telegram message triggers may produce end-user replies.",
     "The runtime can send scheduled outbound Telegram messages later when the user explicitly asks for one.",
     "Do not claim that the platform or runtime cannot send a later Telegram message. That is false.",
-    "If the user explicitly asks you to send a future Telegram message or reminder, you may create an outbound-message schedule.",
+    "If the user explicitly asks you to send a future message or reminder, you may create an outbound-message schedule.",
     "Only create outbound-message schedules when the user clearly asked for a later message.",
     "For outbound-message schedules, include the actual future message text in payload.message.",
     "When the user asks for something like a reminder, fortune cookie later, or follow-up message later, prefer scheduling it instead of refusing.",
     "When you schedule a future outbound Telegram message, acknowledge it clearly in your reply with the timing and what will be sent.",
     "Scheduled wake-ups are silent unless their payload explicitly allows an outbound Telegram send.",
-    trigger.type === "telegram"
+    isTelegramBatchTrigger(trigger)
       ? [
-          "You are responding to a private Telegram message.",
+          "You are responding to one or more private Telegram messages from the same user.",
+          "If multiple queued messages are present, read them as one burst and reply once, coherently.",
           "If the user asks for a future message, use schedule with:",
           '- action: "create"',
           '- payload.kind: "outbound-message"',
@@ -1067,9 +1275,17 @@ function buildSystemInstructions(trigger: SessionTrigger): string {
             "",
             "5. Use the schedule tool with action: \"list\" to check existing schedules. If no maintenance wake is already scheduled, create one for approximately 03:00 UTC tomorrow using schedule with action: \"create\", payload.kind: \"maintenance\".",
             "",
-            "Be concise in what you write to memory files. Prefer updating existing content over appending. Do not fabricate observations — only record what the turns actually show.",
+            "Be concise in what you write to memory files. Prefer updating existing content over appending. Do not fabricate observations - only record what the turns actually show.",
           ].join("\n"),
   ].join("\n");
+}
+
+function executionTriggerType(trigger: ExecutableTrigger): TriggerType {
+  return isTelegramBatchTrigger(trigger) ? "telegram" : "scheduled";
+}
+
+function isStaleScheduledWake(trigger: ScheduledWakePayload): boolean {
+  return Date.now() - Date.parse(trigger.scheduledFor) > SCHEDULE_STALE_AFTER_MS;
 }
 
 function shouldSendReply(text: string): boolean {
@@ -1105,12 +1321,17 @@ type RecentTurnRecord = {
 };
 
 function buildFallbackRecentSummary(
-  trigger: SessionTrigger,
+  trigger: ExecutableTrigger,
   finalText: string,
   replySent: boolean,
 ): string {
-  if (trigger.type === "telegram") {
-    const parts = [`Latest user message: ${shortenForNote(trigger.text, 220)}.`];
+  if (isTelegramBatchTrigger(trigger)) {
+    const parts = [
+      `Latest user burst: ${shortenForNote(
+        trigger.messages.map((message) => message.text).join(" / "),
+        220,
+      )}.`,
+    ];
     if (replySent && shouldSendReply(finalText)) {
       parts.push(`Agent replied: ${shortenForNote(finalText, 220)}.`);
     }
@@ -1134,7 +1355,7 @@ function shortenForNote(text: string, maxLength: number): string {
     return normalized;
   }
 
-  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
 function parseRecentTurnRecords(content: string): RecentTurnRecord[] {
@@ -1171,35 +1392,19 @@ function normalizeScheduledWakeKind(value: unknown): ScheduledWakeKind {
 }
 
 function isScheduledOutbound(
-  trigger: SessionTrigger,
+  trigger: ScheduledWakePayload,
 ): trigger is ScheduledWakePayload & {
   allowSend: true;
   chatId: number;
   outboundText: string;
 } {
   return (
-    trigger.type === "scheduled" &&
     trigger.kind === "outbound-message" &&
     trigger.allowSend === true &&
     typeof trigger.chatId === "number" &&
     typeof trigger.outboundText === "string" &&
     trigger.outboundText.trim() !== ""
   );
-}
-
-function normalizeMemoryPath(targetPath: string): string {
-  const normalized = path.posix.normalize(
-    targetPath.trim() === "" ? MEMORY_ROOT : targetPath.trim(),
-  );
-  if (!normalized.startsWith(MEMORY_ROOT)) {
-    throw new Error("path must stay under /memory");
-  }
-  return normalized;
-}
-
-function resolveWorkspacePath(targetPath: string): string {
-  const resolved = path.posix.resolve(MEMORY_ROOT, targetPath);
-  return normalizeMemoryPath(resolved);
 }
 
 function buildImportedScrapePath(rawUrl: string): string {
