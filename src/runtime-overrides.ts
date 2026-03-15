@@ -58,7 +58,7 @@ export function createAgentModel(env: RuntimeEnv): LanguageModel {
     apiKey: env.OPENAI_API_KEY,
   });
 
-  return openai("gpt-5.4");
+  return openai("gpt-5-mini");
 }
 
 export async function sendTelegramMessage(
