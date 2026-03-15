@@ -8,6 +8,7 @@ import { PersonalAgent, type PersonalAgentEnv } from "./personal-agent";
 export type Env = PersonalAgentEnv & {
   BOT_TOKEN: string;
   OPENAI_API_KEY: string;
+  FIRECRAWL_API_KEY: string;
   ADMIN_API_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   PERSONAL_AGENT: DurableObjectNamespace<PersonalAgent>;

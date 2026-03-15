@@ -50,7 +50,7 @@ The stateful runtime. One instance per user.
 2. Gate checks (dedupe, lease, staleness)
 3. Ensure memory spine exists
 4. Build manifest from spine files + trigger data + recent turns
-5. Run `ToolLoopAgent` with tools: `bash`, `readFile`, `writeFile`, `schedule`, `getTime`
+5. Run `ToolLoopAgent` with tools: `bash`, `readFile`, `writeFile`, `search`, `scrape`, `schedule`, `getTime`
 6. Persist side effects (memory writes, turn log, summary)
 7. Optionally send Telegram reply
 8. Return to idle
@@ -89,12 +89,19 @@ Stored in AgentFS. Seeded on first use:
 
 The model can create additional files and directories. The spine above is the guaranteed minimum.
 
+When the agent imports external material, it stores it under `/memory/imports/<host>/...`. These files are working-set artifacts for later inspection, not durable user memory by default.
+
 ### Memory loop
 
 After each run:
 1. Append turn records to `recent-turns.jsonl`
 2. Include only the last 12 turns in the next prompt (80 stored max)
 3. Refresh `recent-summary.md`
+
+For explicit web lookup requests:
+1. `search` returns compact results directly in context
+2. `scrape` saves full page content into `/memory/imports/...`
+3. The agent can revisit imported files with `readFile` or `bash` without reloading whole pages into prompt context
 
 During maintenance wakes, the agent also:
 1. Reviews `recent-turns.jsonl` for patterns

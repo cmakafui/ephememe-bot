@@ -1,5 +1,9 @@
 import { Agent, type AgentContext } from "agents";
 import { stepCountIs, ToolLoopAgent, tool } from "ai";
+import {
+  scrape as createFirecrawlScrape,
+  search as createFirecrawlSearch,
+} from "firecrawl-aisdk";
 import path from "node:path";
 import { z } from "zod";
 import { AgentFS, type CloudflareStorage } from "agentfs-sdk/cloudflare";
@@ -23,9 +27,13 @@ import type {
 } from "./types";
 
 const MEMORY_ROOT = "/memory";
+const IMPORTS_ROOT = "/memory/imports";
 const SCHEDULE_STALE_AFTER_MS = 30 * 60 * 1000;
 const RUN_LEASE_MS = 2 * 60 * 1000;
 const SILENCE_TOKEN = "[[silence]]";
+const DEFAULT_SEARCH_LIMIT = 5;
+const SEARCH_RESULT_EXCERPT_MAX = 240;
+const SCRAPE_EXCERPT_MAX = 280;
 
 const SPINE_FILES: Record<string, string> = {
   "/memory/profile/identity.md": [
@@ -241,6 +249,8 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
           bash: this.makeBashTool(bash),
           readFile: this.makeReadFileTool(),
           writeFile: this.makeWriteFileTool(),
+          search: this.makeSearchTool(),
+          scrape: this.makeScrapeTool(),
           schedule: this.makeScheduleTool(trigger),
           getTime: this.makeGetTimeTool(),
         },
@@ -546,7 +556,7 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
     for (const [path, content] of Object.entries(SPINE_FILES)) {
       const exists = await this.pathExists(path);
       if (!exists) {
-        await this.fs.writeFile(path, content, "utf8");
+        await this.writeWorkspaceFile(path, content);
       }
     }
   }
@@ -648,8 +658,134 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
         content: z.string(),
       }),
       execute: async ({ path, content }) => {
-        await this.fs.writeFile(resolveWorkspacePath(path), content, "utf8");
+        await this.writeWorkspaceFile(resolveWorkspacePath(path), content);
         return { success: true };
+      },
+    });
+  }
+
+  private makeSearchTool() {
+    const firecrawlSearch = createFirecrawlSearch({
+      apiKey: this.env.FIRECRAWL_API_KEY,
+    }) as {
+      execute?: (
+        input: { query: string; limit?: number },
+        options?: unknown,
+      ) => Promise<{
+        web?: Array<{
+          url?: string;
+          title?: string;
+          description?: string;
+          metadata?: { url?: string; title?: string; description?: string };
+        }>;
+      }>;
+    };
+
+    return tool({
+      description:
+        "Search the web. Keep results in context; use scrape when you want a page saved into /memory for deeper inspection.",
+      inputSchema: z.object({
+        query: z.string().min(1),
+        limit: z.number().int().min(1).max(10).optional(),
+      }),
+      execute: async ({ query, limit }) => {
+        if (!firecrawlSearch.execute) {
+          throw new Error("Firecrawl search tool is unavailable");
+        }
+
+        const result = await firecrawlSearch.execute({
+          query,
+          limit: limit ?? DEFAULT_SEARCH_LIMIT,
+        });
+        const webResults = Array.isArray(result.web) ? result.web : [];
+
+        return {
+          results: webResults
+            .map((entry) => {
+              const url = entry.url ?? entry.metadata?.url;
+              if (!url) {
+                return null;
+              }
+
+              return {
+                url,
+                title: entry.title ?? entry.metadata?.title ?? null,
+                description: shortenForNote(
+                  entry.description ?? entry.metadata?.description ?? "",
+                  SEARCH_RESULT_EXCERPT_MAX,
+                ),
+              };
+            })
+            .filter((entry): entry is NonNullable<typeof entry> => entry !== null),
+        };
+      },
+    });
+  }
+
+  private makeScrapeTool() {
+    const firecrawlScrape = createFirecrawlScrape({
+      apiKey: this.env.FIRECRAWL_API_KEY,
+    }) as {
+      execute?: (
+        input: {
+          url: string;
+          formats?: string[];
+          onlyMainContent?: boolean;
+        },
+        options?: unknown,
+      ) => Promise<{
+        markdown?: string;
+        metadata?: {
+          url?: string;
+          title?: string;
+          description?: string;
+        };
+      }>;
+    };
+
+    return tool({
+      description:
+        "Scrape a single web page, save the full markdown into /memory/imports, and return the saved file path plus a short excerpt.",
+      inputSchema: z.object({
+        url: z.string().url(),
+      }),
+      execute: async ({ url }) => {
+        if (!firecrawlScrape.execute) {
+          throw new Error("Firecrawl scrape tool is unavailable");
+        }
+
+        const result = await firecrawlScrape.execute({
+          url,
+          formats: ["markdown"],
+          onlyMainContent: true,
+        });
+        const markdown = result.markdown?.trim();
+        if (!markdown) {
+          throw new Error("scrape returned no markdown content");
+        }
+
+        const importPath = buildImportedScrapePath(url);
+        const content = formatImportedScrapeDocument({
+          scrapedAt: new Date().toISOString(),
+          title:
+            typeof result.metadata?.title === "string"
+              ? result.metadata.title
+              : null,
+          url,
+          markdown,
+        });
+
+        await this.writeWorkspaceFile(importPath, content);
+
+        return {
+          url,
+          path: importPath,
+          title:
+            typeof result.metadata?.title === "string"
+              ? result.metadata.title
+              : null,
+          excerpt: shortenForNote(markdown, SCRAPE_EXCERPT_MAX),
+        };
       },
     });
   }
@@ -855,6 +991,30 @@ export class PersonalAgent extends Agent<PersonalAgentEnv> {
       .slice(-MAX_RECENT_TURNS_IN_PROMPT)
       .map((record) => formatTurnNote(record.ts, record.speaker, record.text));
   }
+
+  private async writeWorkspaceFile(
+    targetPath: string,
+    content: string,
+  ): Promise<void> {
+    await this.ensureWorkspaceDirectory(path.posix.dirname(targetPath));
+    await this.fs.writeFile(targetPath, content, "utf8");
+  }
+
+  private async ensureWorkspaceDirectory(targetPath: string): Promise<void> {
+    const normalizedPath = normalizeMemoryPath(targetPath);
+    const segments = normalizedPath.split("/").filter(Boolean);
+    let current = "";
+
+    for (const segment of segments) {
+      current += `/${segment}`;
+      if (current === MEMORY_ROOT) {
+        continue;
+      }
+      if (!(await this.pathExists(current))) {
+        await this.fs.mkdir(current);
+      }
+    }
+  }
 }
 
 function buildSystemInstructions(trigger: SessionTrigger): string {
@@ -862,6 +1022,10 @@ function buildSystemInstructions(trigger: SessionTrigger): string {
     "You are an ephemeral personal agent with durable memory in /memory.",
     "Use the available tools to inspect and update memory when useful.",
     "Be concise, calm, and useful.",
+    "Use search for web discovery and keep search results in context.",
+    "Use scrape when you want a page saved into /memory/imports for deeper inspection with readFile or bash.",
+    "Scraped pages are workspace material, not durable memory by default.",
+    "When a docs site exposes llms.txt, prefer scraping that first before drilling into specific pages.",
     "Use /memory/journal/recent-turns.jsonl and the recent turns included in the prompt as short-term conversational memory.",
     "When the user states a lasting preference, stable fact, or unresolved task, update the relevant profile or open-loops file during this same session.",
     "Do not create durable memory for ephemeral filler.",
@@ -1036,6 +1200,61 @@ function normalizeMemoryPath(targetPath: string): string {
 function resolveWorkspacePath(targetPath: string): string {
   const resolved = path.posix.resolve(MEMORY_ROOT, targetPath);
   return normalizeMemoryPath(resolved);
+}
+
+function buildImportedScrapePath(rawUrl: string): string {
+  const parsedUrl = new URL(rawUrl);
+  const hostSegment = sanitizePathSegment(parsedUrl.hostname);
+  const pathname = parsedUrl.pathname.replace(/\/+$/, "");
+  const pathSegments = pathname
+    .split("/")
+    .filter(Boolean)
+    .map(sanitizePathSegment)
+    .filter((segment) => segment !== "");
+  const fileBase =
+    pathSegments.length > 0 ? pathSegments.join("__") : "index";
+  const querySuffix =
+    parsedUrl.search !== ""
+      ? `__q-${hashString(parsedUrl.searchParams.toString())}`
+      : "";
+
+  return `${IMPORTS_ROOT}/${hostSegment}/${fileBase}${querySuffix}.md`;
+}
+
+function sanitizePathSegment(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized === "" ? "item" : normalized;
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function formatImportedScrapeDocument(input: {
+  scrapedAt: string;
+  title: string | null;
+  url: string;
+  markdown: string;
+}): string {
+  return [
+    "# Imported Page",
+    "",
+    `- Source: ${input.url}`,
+    `- Scraped At: ${input.scrapedAt}`,
+    `- Title: ${input.title ?? "Unknown"}`,
+    "",
+    "## Content",
+    "",
+    input.markdown.trim(),
+  ].join("\n");
 }
 
 function parseWhen(when: string): Date | string | number {

@@ -21,6 +21,7 @@ describe("Ephememe runtime", () => {
     Object.assign(env as Record<string, unknown>, {
       BOT_TOKEN: "test-bot-token",
       OPENAI_API_KEY: "test-openai-key",
+      FIRECRAWL_API_KEY: "test-firecrawl-key",
       ADMIN_API_TOKEN: "test-admin-token",
       TELEGRAM_WEBHOOK_SECRET: undefined,
     });

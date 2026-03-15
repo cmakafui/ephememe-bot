@@ -8,6 +8,8 @@ Each Telegram user gets their own [Durable Object](https://developers.cloudflare
 
 Memory is stored as plain files — `identity.md`, `preferences.md`, `open-loops.md`, `recent-turns.jsonl`. The agent reads and writes these files using tools available to the model. There are no embeddings, no vector stores. The serialization format for identity is natural language.
 
+External pages can also be imported into the workspace under `/memory/imports`. Search results stay in model context; scraped pages become files the agent can inspect incrementally with `readFile` or `bash`.
+
 The agent can schedule its own future wake-ups. Maintenance wakes are silent — the agent reviews recent conversations, updates its context files, and goes back to sleep. Outbound wakes deliver a message the user explicitly asked for.
 
 ## Architecture
@@ -37,6 +39,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
     recent-turns.jsonl       # Conversation log (last 80 turns)
   inbox/
     open-loops.md            # Unresolved tasks and threads
+  imports/
+    <host>/*.md             # Scraped external pages saved for later inspection
 ```
 
 ## Tools available to the model
@@ -46,6 +50,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 | `bash` | Shell commands inside `/memory` (no network, no JS/Python) |
 | `readFile` | Read files from the workspace |
 | `writeFile` | Write files to the workspace |
+| `search` | Search the web for pages to inspect |
+| `scrape` | Scrape a page into `/memory/imports/...` and return its saved path |
 | `schedule` | Create, list, or cancel future wake-ups |
 | `getTime` | Current time |
 
@@ -67,6 +73,7 @@ POST /admin/agents/:id/wake         Manual maintenance wake (auth required)
 ```bash
 npx wrangler secret put BOT_TOKEN
 npx wrangler secret put OPENAI_API_KEY
+npx wrangler secret put FIRECRAWL_API_KEY
 npx wrangler secret put ADMIN_API_TOKEN
 npx wrangler secret put BOT_INFO              # JSON from Telegram getMe
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET  # optional

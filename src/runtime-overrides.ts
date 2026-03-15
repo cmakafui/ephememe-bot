@@ -5,6 +5,7 @@ import { Api } from "grammy";
 export interface RuntimeEnv {
   BOT_TOKEN: string;
   OPENAI_API_KEY: string;
+  FIRECRAWL_API_KEY: string;
 }
 
 export interface TelegramSendInput {
